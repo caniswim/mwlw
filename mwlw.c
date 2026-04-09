@@ -1,8 +1,10 @@
 /*
  * mwlw — Minimal Wayland live wallpaper client
  *
- * Single VA-API decode → VPP color convert (BT.709 YCbCr→RGB) → DMA-BUF
- * shared across N layer-shell surfaces. Zero-copy, zero CPU pixel work.
+ * Single VA-API decode → DMA-BUF shared across N layer-shell surfaces.
+ * If compositor supports wp_color_representation_v1: direct P010 passthrough (BT.709).
+ * Otherwise: VPP hardware color convert P010→BGRX (BT.709) as fallback.
+ * Zero-copy, zero CPU pixel work.
  */
 
 #define _GNU_SOURCE
@@ -13,12 +15,14 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <malloc.h>
 #include <sys/timerfd.h>
 
 #include <wayland-client.h>
 #include "wlr-layer-shell-client.h"
 #include "linux-dmabuf-client.h"
 #include "viewporter-client.h"
+#include "color-representation-client.h"
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -31,7 +35,7 @@
 #include <va/va_drmcommon.h>
 
 #define MAX_OUTPUTS 8
-#define VPP_POOL_SIZE 2
+#define VPP_POOL_SIZE 3  /* triple-buffer: safe without release tracking */
 
 /* ── Output ────────────────────────────────────────────────────────────── */
 struct output {
@@ -54,6 +58,7 @@ static struct {
     struct zwlr_layer_shell_v1 *layer_shell;
     struct zwp_linux_dmabuf_v1 *dmabuf_manager;
     struct wp_viewporter *viewporter;
+    struct wp_color_representation_manager_v1 *color_repr_manager;
 
     struct output outputs[MAX_OUTPUTS];
     int n_outputs;
@@ -65,17 +70,17 @@ static struct {
     VADisplay va_display;
     int video_stream_idx;
 
-    /* VPP (color conversion) */
+    /* VPP (color conversion — fallback when no color-representation protocol) */
     VAConfigID vpp_config;
     VAContextID vpp_context;
     VASurfaceID vpp_surfaces[VPP_POOL_SIZE];
+    struct wl_buffer *vpp_wl_buffers[VPP_POOL_SIZE]; /* persistent, pre-exported */
     int vpp_current; /* round-robin index */
 
     /* current frame */
     struct wl_buffer *current_buffer;
-    AVFrame *current_hw_frame;
-    VADRMPRIMESurfaceDescriptor current_prime;
-    bool has_prime;
+    AVFrame *hw_frame;   /* reusable decode frame */
+    AVPacket *pkt;       /* reusable packet */
     uint32_t frame_width, frame_height;
 
     bool running, loop;
@@ -146,6 +151,9 @@ static void registry_global(void *d, struct wl_registry *reg, uint32_t name,
         state.dmabuf_manager = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface, 3);
     else if (!strcmp(iface, wp_viewporter_interface.name))
         state.viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
+    else if (!strcmp(iface, wp_color_representation_manager_v1_interface.name))
+        state.color_repr_manager = wl_registry_bind(reg, name,
+            &wp_color_representation_manager_v1_interface, 1);
     else if (!strcmp(iface, wl_output_interface.name) && state.n_outputs < MAX_OUTPUTS) {
         struct output *o = &state.outputs[state.n_outputs++];
         memset(o, 0, sizeof(*o));
@@ -172,18 +180,15 @@ static void create_wallpaper_surface(struct output *o) {
     zwlr_layer_surface_v1_add_listener(o->layer_surface, &layer_listener, o);
     if (state.viewporter)
         o->viewport = wp_viewporter_get_viewport(state.viewporter, o->surface);
+    /* Mark fully opaque — lets compositor skip alpha blending and skip
+     * rendering anything behind this surface (we're BACKGROUND layer) */
+    struct wl_region *opaque = wl_compositor_create_region(state.compositor);
+    wl_region_add(opaque, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_set_opaque_region(o->surface, opaque);
+    wl_region_destroy(opaque);
+    /* TODO: when compositor supports wp_color_representation_v1, set BT.709
+     * coefficients here and bypass VPP entirely (direct P010 passthrough) */
     wl_surface_commit(o->surface);
-}
-
-/* ── Release frame resources ───────────────────────────────────────────── */
-static void release_current_frame(void) {
-    if (state.current_buffer) { wl_buffer_destroy(state.current_buffer); state.current_buffer = NULL; }
-    if (state.has_prime) {
-        for (uint32_t i = 0; i < state.current_prime.num_objects; i++)
-            close(state.current_prime.objects[i].fd);
-        state.has_prime = false;
-    }
-    if (state.current_hw_frame) av_frame_free(&state.current_hw_frame);
 }
 
 /* ── Buffer listener ───────────────────────────────────────────────────── */
@@ -262,59 +267,58 @@ static VASurfaceID vpp_convert(VASurfaceID input_surface) {
     return output;
 }
 
-/* ── Export RGB surface → wl_buffer ────────────────────────────────────── */
-static struct wl_buffer *export_rgb_to_wl_buffer(VASurfaceID rgb_surface) {
-    vaSyncSurface(state.va_display, rgb_surface);
+/* ── Pre-export VPP surfaces → persistent wl_buffers (called once) ────── */
+static bool init_wl_buffers(void) {
+    for (int i = 0; i < VPP_POOL_SIZE; i++) {
+        VADRMPRIMESurfaceDescriptor prime = {0};
+        VAStatus st = vaExportSurfaceHandle(state.va_display, state.vpp_surfaces[i],
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+            &prime);
+        if (st != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "[init_wl] export surface %d failed: %s\n", i, vaErrorStr(st));
+            return false;
+        }
 
-    VADRMPRIMESurfaceDescriptor prime = {0};
-    VAStatus st = vaExportSurfaceHandle(state.va_display, rgb_surface,
-        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
-        &prime);
-    if (st != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "[export] failed: %s\n", vaErrorStr(st));
-        return NULL;
-    }
+        if (i == 0) {
+            char fcc[5] = {0}; memcpy(fcc, &prime.fourcc, 4);
+            fprintf(stderr, "[init_wl] fourcc=%s %ux%u, %u planes, modifier=%#lx\n",
+                fcc, prime.width, prime.height, prime.layers[0].num_planes,
+                (unsigned long)prime.objects[0].drm_format_modifier);
+        }
 
-    static bool logged = false;
-    if (!logged) {
-        char fcc[5] = {0}; memcpy(fcc, &prime.fourcc, 4);
-        fprintf(stderr, "[export] fourcc=%s layers=%u planes=%u\n",
-            fcc, prime.num_layers, prime.layers[0].num_planes);
-        for (uint32_t j = 0; j < prime.layers[0].num_planes; j++)
-            fprintf(stderr, "[export]   plane[%u]: offset=%u pitch=%u\n",
-                j, prime.layers[0].offset[j], prime.layers[0].pitch[j]);
-        fprintf(stderr, "[export]   modifier=%#lx\n",
-            (unsigned long)prime.objects[0].drm_format_modifier);
-        logged = true;
-    }
+        struct zwp_linux_buffer_params_v1 *bp =
+            zwp_linux_dmabuf_v1_create_params(state.dmabuf_manager);
 
-    struct zwp_linux_buffer_params_v1 *bp =
-        zwp_linux_dmabuf_v1_create_params(state.dmabuf_manager);
+        for (uint32_t j = 0; j < prime.layers[0].num_planes; j++) {
+            uint32_t oi = prime.layers[0].object_index[j];
+            zwp_linux_buffer_params_v1_add(bp,
+                prime.objects[oi].fd, j,
+                prime.layers[0].offset[j],
+                prime.layers[0].pitch[j],
+                prime.objects[oi].drm_format_modifier >> 32,
+                prime.objects[oi].drm_format_modifier & 0xFFFFFFFF);
+        }
 
-    for (uint32_t j = 0; j < prime.layers[0].num_planes; j++) {
-        uint32_t oi = prime.layers[0].object_index[j];
-        zwp_linux_buffer_params_v1_add(bp,
-            prime.objects[oi].fd, j,
-            prime.layers[0].offset[j],
-            prime.layers[0].pitch[j],
-            prime.objects[oi].drm_format_modifier >> 32,
-            prime.objects[oi].drm_format_modifier & 0xFFFFFFFF);
-    }
+        struct wl_buffer *buf = zwp_linux_buffer_params_v1_create_immed(bp,
+            prime.width, prime.height, prime.layers[0].drm_format, 0);
+        zwp_linux_buffer_params_v1_destroy(bp);
 
-    struct wl_buffer *buf = zwp_linux_buffer_params_v1_create_immed(bp,
-        prime.width, prime.height, prime.layers[0].drm_format, 0);
-    zwp_linux_buffer_params_v1_destroy(bp);
+        /* FDs were dup'd by Wayland socket — close our copies */
+        for (uint32_t k = 0; k < prime.num_objects; k++)
+            close(prime.objects[k].fd);
 
-    if (buf) {
+        if (!buf) {
+            fprintf(stderr, "[init_wl] wl_buffer creation failed for surface %d\n", i);
+            return false;
+        }
+
         wl_buffer_add_listener(buf, &buffer_listener, NULL);
-        state.current_prime = prime;
-        state.has_prime = true;
-    } else {
-        for (uint32_t i = 0; i < prime.num_objects; i++)
-            close(prime.objects[i].fd);
+        state.vpp_wl_buffers[i] = buf;
     }
-    return buf;
+
+    fprintf(stderr, "[init_wl] %d persistent wl_buffers pre-exported\n", VPP_POOL_SIZE);
+    return true;
 }
 
 /* ── Decoder setup ─────────────────────────────────────────────────────── */
@@ -364,59 +368,46 @@ static bool init_decoder(const char *path) {
     return true;
 }
 
-/* ── Decode → VPP convert → wl_buffer ──────────────────────────────────── */
+/* ── Decode → VPP convert (no export, no sync — all pre-done) ─────────── */
 static bool decode_next_frame(void) {
-    AVPacket *pkt = av_packet_alloc();
-    AVFrame *hw_frame = av_frame_alloc();
     bool got = false;
 
     while (!got) {
-        int ret = av_read_frame(state.fmt_ctx, pkt);
+        int ret = av_read_frame(state.fmt_ctx, state.pkt);
         if (ret < 0) {
             if (state.loop && ret == AVERROR_EOF) {
                 av_seek_frame(state.fmt_ctx, state.video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(state.dec_ctx);
-                av_packet_unref(pkt);
                 continue;
             }
             break;
         }
-        if (pkt->stream_index != state.video_stream_idx) { av_packet_unref(pkt); continue; }
+        if (state.pkt->stream_index != state.video_stream_idx) {
+            av_packet_unref(state.pkt);
+            continue;
+        }
 
-        ret = avcodec_send_packet(state.dec_ctx, pkt);
-        av_packet_unref(pkt);
+        ret = avcodec_send_packet(state.dec_ctx, state.pkt);
+        av_packet_unref(state.pkt);
         if (ret < 0) continue;
 
-        ret = avcodec_receive_frame(state.dec_ctx, hw_frame);
+        av_frame_unref(state.hw_frame);
+        ret = avcodec_receive_frame(state.dec_ctx, state.hw_frame);
         if (ret == AVERROR(EAGAIN)) continue;
         if (ret < 0) break;
 
-        /* hw_frame->data[3] is the VASurfaceID */
-        VASurfaceID yuv_surface = (VASurfaceID)(uintptr_t)hw_frame->data[3];
+        VASurfaceID yuv = (VASurfaceID)(uintptr_t)state.hw_frame->data[3];
 
-        /* VPP: P010 (BT.709 YCbCr) → BGRX (RGB) in hardware */
-        VASurfaceID rgb_surface = vpp_convert(yuv_surface);
-        if (rgb_surface == VA_INVALID_SURFACE) {
-            av_frame_unref(hw_frame);
-            continue;
-        }
+        /* VPP convert writes into pre-exported surface — no export or sync needed */
+        int target = state.vpp_current;
+        VASurfaceID rgb = vpp_convert(yuv);
+        if (rgb == VA_INVALID_SURFACE) continue;
 
-        /* export RGB surface as DMA-BUF → wl_buffer */
-        release_current_frame();
-        state.current_hw_frame = hw_frame;
-        state.current_buffer = export_rgb_to_wl_buffer(rgb_surface);
-
-        if (!state.current_buffer) {
-            av_frame_free(&state.current_hw_frame);
-            hw_frame = av_frame_alloc();
-            continue;
-        }
-
+        /* DMA-BUF implicit sync: compositor waits on GPU fence automatically */
+        state.current_buffer = state.vpp_wl_buffers[target];
         got = true;
     }
 
-    if (!got) av_frame_free(&hw_frame);
-    av_packet_free(&pkt);
     return got;
 }
 
@@ -437,6 +428,10 @@ static void present_frame(void) {
 
 /* ── Main ──────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
+    /* Force glibc to use heap instead of mmap for FFmpeg packet buffers (<1MB).
+     * Eliminates ~1500 mmap/munmap syscalls per loop — ~21% of syscall overhead. */
+    mallopt(M_MMAP_THRESHOLD, 1 << 20);
+
     state.loop = true;
     int arg_idx = 1;
     while (arg_idx < argc && argv[arg_idx][0] == '-') {
@@ -459,6 +454,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[wl] missing globals\n"); return 1;
     }
 
+    fprintf(stderr, "[wl] color_representation_v1: %s\n",
+        state.color_repr_manager ? "available (direct P010 passthrough ready)" : "unavailable (using VPP fallback)");
     fprintf(stderr, "[wl] %d outputs:\n", state.n_outputs);
     for (int i = 0; i < state.n_outputs; i++)
         fprintf(stderr, "  %s: %dx%d @%.1fHz t=%d\n",
@@ -468,8 +465,13 @@ int main(int argc, char *argv[]) {
     /* Decoder */
     if (!init_decoder(state.video_path)) return 1;
 
-    /* VPP color conversion */
+    /* VPP color conversion + pre-export persistent wl_buffers */
     if (!init_vpp(state.frame_width, state.frame_height)) return 1;
+    if (!init_wl_buffers()) return 1;
+
+    /* Reusable decode resources */
+    state.pkt = av_packet_alloc();
+    state.hw_frame = av_frame_alloc();
 
     /* Primary = lowest refresh */
     int pi = 0;
@@ -520,7 +522,10 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     close(tfd);
-    release_current_frame();
+    av_frame_free(&state.hw_frame);
+    av_packet_free(&state.pkt);
+    for (int i = 0; i < VPP_POOL_SIZE; i++)
+        if (state.vpp_wl_buffers[i]) wl_buffer_destroy(state.vpp_wl_buffers[i]);
     for (int i = 0; i < state.n_outputs; i++) {
         struct output *o = &state.outputs[i];
         if (o->layer_surface) zwlr_layer_surface_v1_destroy(o->layer_surface);
@@ -535,6 +540,8 @@ int main(int argc, char *argv[]) {
     avformat_close_input(&state.fmt_ctx);
     av_buffer_unref(&state.hw_device_ctx);
     zwp_linux_dmabuf_v1_destroy(state.dmabuf_manager);
+    if (state.color_repr_manager)
+        wp_color_representation_manager_v1_destroy(state.color_repr_manager);
     wp_viewporter_destroy(state.viewporter);
     zwlr_layer_shell_v1_destroy(state.layer_shell);
     wl_compositor_destroy(state.compositor);

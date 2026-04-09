@@ -8,7 +8,8 @@ SRCS = mwlw.c \
        wlr-layer-shell-client.c \
        linux-dmabuf-client.c \
        viewporter-client.c \
-       xdg-shell-client.c
+       xdg-shell-client.c \
+       color-representation-client.c
 
 OBJS = $(SRCS:.c=.o)
 
