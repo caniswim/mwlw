@@ -373,9 +373,26 @@ static bool decode_next_frame(void) {
     bool got = false;
 
     while (!got) {
-        int ret = av_read_frame(state.fmt_ctx, state.pkt);
+        /* First, try to drain any buffered frames from the decoder */
+        av_frame_unref(state.hw_frame);
+        int ret = avcodec_receive_frame(state.dec_ctx, state.hw_frame);
+        if (ret == 0) {
+            VASurfaceID yuv = (VASurfaceID)(uintptr_t)state.hw_frame->data[3];
+            int target = state.vpp_current;
+            VASurfaceID rgb = vpp_convert(yuv);
+            if (rgb == VA_INVALID_SURFACE) continue;
+
+            state.current_buffer = state.vpp_wl_buffers[target];
+            got = true;
+            continue;
+        }
+        if (ret != AVERROR(EAGAIN)) break;
+
+        /* Decoder needs more input — read a packet and feed it */
+        ret = av_read_frame(state.fmt_ctx, state.pkt);
         if (ret < 0) {
             if (state.loop && ret == AVERROR_EOF) {
+                avcodec_send_packet(state.dec_ctx, NULL);
                 av_seek_frame(state.fmt_ctx, state.video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(state.dec_ctx);
                 continue;
@@ -389,23 +406,7 @@ static bool decode_next_frame(void) {
 
         ret = avcodec_send_packet(state.dec_ctx, state.pkt);
         av_packet_unref(state.pkt);
-        if (ret < 0) continue;
-
-        av_frame_unref(state.hw_frame);
-        ret = avcodec_receive_frame(state.dec_ctx, state.hw_frame);
-        if (ret == AVERROR(EAGAIN)) continue;
-        if (ret < 0) break;
-
-        VASurfaceID yuv = (VASurfaceID)(uintptr_t)state.hw_frame->data[3];
-
-        /* VPP convert writes into pre-exported surface — no export or sync needed */
-        int target = state.vpp_current;
-        VASurfaceID rgb = vpp_convert(yuv);
-        if (rgb == VA_INVALID_SURFACE) continue;
-
-        /* DMA-BUF implicit sync: compositor waits on GPU fence automatically */
-        state.current_buffer = state.vpp_wl_buffers[target];
-        got = true;
+        /* Whether send succeeded or returned EAGAIN, loop back to try receive_frame */
     }
 
     return got;

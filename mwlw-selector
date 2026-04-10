@@ -1,0 +1,57 @@
+#!/bin/bash
+# mwlw-selector — Wallpaper selector for MWLW
+# Usage:
+#   mwlw-selector --select   Open KDE file picker (Dolphin dialog)
+#   mwlw-selector --random   Pick random video from wallpaper dir
+
+WALLPAPER_DIR="${MWLW_WALLPAPER_DIR:-$HOME/Imagens/Wallpapers/Live}"
+MWLW_BIN="${MWLW_BIN:-mwlw}"
+
+kill_existing() {
+    pkill -x mwlw 2>/dev/null
+    sleep 0.3
+}
+
+select_dolphin() {
+    kdialog --getopenfilename "$WALLPAPER_DIR" \
+        "Video Files (*.mp4 *.mkv *.webm *.mov *.avi *.MP4 *.MKV *.WEBM *.MOV *.AVI)" \
+        --title "MWLW — Select Live Wallpaper"
+}
+
+select_random() {
+    shopt -s nullglob nocaseglob
+    local files=("$WALLPAPER_DIR"/*.{mp4,mkv,webm,mov,avi})
+    shopt -u nullglob nocaseglob
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        notify-send -a "MWLW" "MWLW" "No videos found in $WALLPAPER_DIR" 2>/dev/null
+        exit 1
+    fi
+
+    printf '%s' "${files[RANDOM % ${#files[@]}]}"
+}
+
+case "${1:-}" in
+    --select|-s)
+        video=$(select_dolphin)
+        ;;
+    --random|-r)
+        video=$(select_random)
+        ;;
+    *)
+        echo "Usage: mwlw-selector [--select|--random]"
+        echo "  --select, -s   Open KDE file picker (Dolphin dialog)"
+        echo "  --random, -r   Pick random video from $WALLPAPER_DIR"
+        exit 1
+        ;;
+esac
+
+if [[ -z "$video" || ! -f "$video" ]]; then
+    exit 0
+fi
+
+kill_existing
+nohup "$MWLW_BIN" "$video" &>/dev/null &
+disown
+
+notify-send -a "MWLW" "MWLW" "$(basename "$video")" -t 3000 2>/dev/null
