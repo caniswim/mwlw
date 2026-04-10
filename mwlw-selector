@@ -1,14 +1,20 @@
 #!/bin/bash
 # mwlw-selector — Wallpaper selector for MWLW
 # Usage:
-#   mwlw-selector --select   Open KDE file picker (Dolphin dialog)
-#   mwlw-selector --random   Pick random video from wallpaper dir
+#   mwlw-selector --select [--mode dark|light]   Open KDE file picker
+#   mwlw-selector --random [--mode dark|light]   Pick random video from wallpaper dir
 
 WALLPAPER_DIR="${MWLW_WALLPAPER_DIR:-$HOME/Imagens/Wallpapers/Live}"
 MWLW_BIN="${MWLW_BIN:-mwlw}"
 
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+THUMBNAIL_DIR="$XDG_CACHE_HOME/mwlw/thumbnails"
+
 kill_existing() {
     pkill -x mwlw 2>/dev/null
+    pkill -f -9 mpvpaper 2>/dev/null
     sleep 0.3
 }
 
@@ -31,17 +37,98 @@ select_random() {
     printf '%s' "${files[RANDOM % ${#files[@]}]}"
 }
 
-case "${1:-}" in
-    --select|-s)
-        video=$(select_dolphin)
-        ;;
-    --random|-r)
-        video=$(select_random)
-        ;;
+extract_thumbnail() {
+    local video="$1"
+    mkdir -p "$THUMBNAIL_DIR"
+    local thumbnail="$THUMBNAIL_DIR/$(basename "$video").jpg"
+    ffmpeg -y -i "$video" -vframes 1 "$thumbnail" 2>/dev/null
+    [[ -f "$thumbnail" ]] && printf '%s' "$thumbnail"
+}
+
+# Caelestia: pass thumbnail as wallpaper image, then fix path back to video
+update_colors_caelestia() {
+    local video="$1"
+    local thumbnail="$2"
+    local wallpaper_path_file="$XDG_STATE_HOME/caelestia/wallpaper/path.txt"
+
+    caelestia wallpaper --file "$thumbnail" --no-smart
+
+    # caelestia set wallpaperPath to the thumbnail;
+    # restore it to the actual video path
+    mkdir -p "$(dirname "$wallpaper_path_file")"
+    printf '%s' "$video" > "$wallpaper_path_file"
+}
+
+# ii shell: pass thumbnail to switchwall.sh, then fix config back to video
+update_colors_ii() {
+    local video="$1"
+    local thumbnail="$2"
+    local mode="$3"
+    local switchwall="$XDG_CONFIG_HOME/quickshell/ii/scripts/colors/switchwall.sh"
+    local config_file="$XDG_CONFIG_HOME/illogical-impulse/config.json"
+
+    "$switchwall" --image "$thumbnail" --mode "$mode"
+
+    if [[ -f "$config_file" ]]; then
+        jq --arg vpath "$video" --arg tpath "$thumbnail" '
+            .background.wallpaperPath = $vpath |
+            .background.thumbnailPath = $tpath
+        ' "$config_file" > "$config_file.tmp" \
+            && mv "$config_file.tmp" "$config_file"
+    fi
+}
+
+apply_sequences_to_terms() {
+    local seq_file="$XDG_STATE_HOME/caelestia/sequences.txt"
+    [[ -f "$seq_file" ]] || return
+    for pt in /dev/pts/[0-9]*; do
+        cat "$seq_file" > "$pt" 2>/dev/null
+    done
+}
+
+update_color_scheme() {
+    local video="$1"
+    local mode="$2"
+    local thumbnail
+    thumbnail=$(extract_thumbnail "$video")
+    [[ -z "$thumbnail" ]] && return 1
+
+    # Use only one pipeline — avoid conflicts (ii's gsettings changes trigger Caelestia)
+    if command -v caelestia &>/dev/null; then
+        update_colors_caelestia "$video" "$thumbnail"
+        apply_sequences_to_terms
+    else
+        local switchwall="$XDG_CONFIG_HOME/quickshell/ii/scripts/colors/switchwall.sh"
+        if [[ -x "$switchwall" ]]; then
+            update_colors_ii "$video" "$thumbnail" "$mode"
+        fi
+    fi
+}
+
+# Parse arguments
+action=""
+mode=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --select|-s) action="select"; shift ;;
+        --random|-r) action="random"; shift ;;
+        --mode|-m)   mode="$2"; shift 2 ;;
+        *)
+            echo "Usage: mwlw-selector [--select|--random] [--mode dark|light]"
+            echo "  --select, -s   Open KDE file picker (Dolphin dialog)"
+            echo "  --random, -r   Pick random video from $WALLPAPER_DIR"
+            echo "  --mode,   -m   Color scheme mode (default: auto-detect)"
+            exit 1
+            ;;
+    esac
+done
+
+case "$action" in
+    select) video=$(select_dolphin) ;;
+    random) video=$(select_random) ;;
     *)
-        echo "Usage: mwlw-selector [--select|--random]"
-        echo "  --select, -s   Open KDE file picker (Dolphin dialog)"
-        echo "  --random, -r   Pick random video from $WALLPAPER_DIR"
+        echo "Usage: mwlw-selector [--select|--random] [--mode dark|light]"
         exit 1
         ;;
 esac
@@ -50,8 +137,16 @@ if [[ -z "$video" || ! -f "$video" ]]; then
     exit 0
 fi
 
+# Auto-detect mode if not specified
+if [[ -z "$mode" ]]; then
+    current=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null | tr -d "'")
+    [[ "$current" == "prefer-light" ]] && mode="light" || mode="dark"
+fi
+
 kill_existing
 nohup "$MWLW_BIN" "$video" &>/dev/null &
 disown
+
+update_color_scheme "$video" "$mode"
 
 notify-send -a "MWLW" "MWLW" "$(basename "$video")" -t 3000 2>/dev/null
